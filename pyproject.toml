@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "runway"
+version = "0.1.0"
+description = "CLI for Plane project management"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["requests"]
+
+[project.scripts]
+runway = "runway:main"
