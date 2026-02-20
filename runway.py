@@ -2,13 +2,51 @@
 import argparse, os, sys, json, requests
 from pathlib import Path
 
-CONFIG = Path.home() / ".runway.json"
+GLOBAL_CONFIG = Path.home() / ".runway.json"
+LOCAL_CONFIG = ".runway.json"
+
+def find_project_root():
+    """Walk up to find .runway.json or .git directory."""
+    cwd = Path.cwd()
+    for p in [cwd] + list(cwd.parents):
+        if (p / LOCAL_CONFIG).exists() or (p / ".git").exists():
+            return p
+    return cwd
 
 def load_config():
-    if CONFIG.exists():
-        for k, v in json.loads(CONFIG.read_text()).items():
+    """Load config with precedence: local .runway.json > global per-project > global default."""
+    project_root = find_project_root()
+    local_config = project_root / LOCAL_CONFIG
+    
+    # 1. Check for local .runway.json in project root
+    if local_config.exists():
+        for k, v in json.loads(local_config.read_text()).items():
             os.environ.setdefault(f"PLANE_{k.upper()}", v)
         return
+    
+    # 2. Check global config for per-project or default settings
+    if GLOBAL_CONFIG.exists():
+        global_data = json.loads(GLOBAL_CONFIG.read_text())
+        
+        # Check if this is the new format with "projects" key
+        if "projects" in global_data:
+            project_key = str(project_root)
+            if project_key in global_data["projects"]:
+                for k, v in global_data["projects"][project_key].items():
+                    os.environ.setdefault(f"PLANE_{k.upper()}", v)
+                return
+            # Fall back to default if exists
+            if "default" in global_data:
+                for k, v in global_data["default"].items():
+                    os.environ.setdefault(f"PLANE_{k.upper()}", v)
+                return
+        else:
+            # Old format - use as-is (backwards compatible)
+            for k, v in global_data.items():
+                os.environ.setdefault(f"PLANE_{k.upper()}", v)
+            return
+    
+    # 3. Fall back to .env files
     for p in [Path.cwd() / ".env", Path(__file__).parent / ".env"]:
         if p.exists():
             for line in p.read_text().splitlines():
@@ -17,9 +55,26 @@ def load_config():
                     os.environ.setdefault(k.strip(), v.strip())
             return
 
-def configure():
+def configure(local=False):
+    """Configure runway. --local saves to project, otherwise saves to global config."""
     print("Runway Configuration\n" + "=" * 40)
-    existing = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    project_root = find_project_root()
+    
+    if local:
+        config_path = project_root / LOCAL_CONFIG
+        existing = json.loads(config_path.read_text()) if config_path.exists() else {}
+        scope = "project"
+    else:
+        config_path = GLOBAL_CONFIG
+        existing = {}
+        if config_path.exists():
+            global_data = json.loads(config_path.read_text())
+            if "projects" in global_data:
+                existing = global_data["projects"].get(str(project_root), global_data.get("default", {}))
+            else:
+                existing = global_data
+        scope = "global (for this project)"
+    
     config = {
         "api_key": input(f"API Key [{existing.get('api_key', '')[:8]}...]: ").strip() or existing.get("api_key", ""),
         "base_url": input(f"Base URL [{existing.get('base_url', 'https://api.plane.so')}]: ").strip() or existing.get("base_url", "https://api.plane.so"),
@@ -28,9 +83,26 @@ def configure():
     }
     if not all([config["api_key"], config["workspace"], config["project_id"]]):
         sys.exit("Error: api_key, workspace, and project_id required")
-    CONFIG.write_text(json.dumps(config, indent=2))
-    CONFIG.chmod(0o600)
-    print(f"\n✓ Saved to {CONFIG}")
+    
+    if local:
+        config_path.write_text(json.dumps(config, indent=2))
+    else:
+        # Save to global config under projects key
+        if GLOBAL_CONFIG.exists():
+            global_data = json.loads(GLOBAL_CONFIG.read_text())
+            # Migrate old format if needed
+            if "projects" not in global_data and "api_key" in global_data:
+                global_data = {"default": global_data, "projects": {}}
+            elif "projects" not in global_data:
+                global_data = {"projects": {}}
+        else:
+            global_data = {"projects": {}}
+        global_data["projects"][str(project_root)] = config
+        config_path = GLOBAL_CONFIG
+        config_path.write_text(json.dumps(global_data, indent=2))
+    
+    config_path.chmod(0o600)
+    print(f"\n✓ Saved to {config_path} ({scope})")
 
 class PlaneClient:
     # State name to ID mapping (fetched once)
@@ -190,6 +262,21 @@ class PlaneClient:
         iid = self._resolve_id(issue_id)
         requests.delete(f"{self._cycles_url()}/{cid}/cycle-issues/{iid}/", headers=self._headers()).raise_for_status()
 
+    def cycle_list_issues(self, cycle_id):
+        cid = self._resolve_id(cycle_id, self.list_cycles())
+        r = requests.get(f"{self._cycles_url()}/{cid}/cycle-issues/", headers=self._headers())
+        r.raise_for_status()
+        return self._get_results(r.json())
+
+    def cycle_clear_issues(self, cycle_id):
+        """Remove all issues from a cycle"""
+        issues = self.cycle_list_issues(cycle_id)
+        cid = self._resolve_id(cycle_id, self.list_cycles())
+        for issue in issues:
+            iid = issue.get('issue') or issue.get('id')
+            requests.delete(f"{self._cycles_url()}/{cid}/cycle-issues/{iid}/", headers=self._headers()).raise_for_status()
+        return len(issues)
+
     def list_modules(self):
         r = requests.get(f"{self._modules_url()}/", headers=self._headers())
         r.raise_for_status()
@@ -232,15 +319,23 @@ class PlaneClient:
         iid = self._resolve_id(issue_id)
         requests.delete(f"{self._modules_url()}/{mid}/module-issues/{iid}/", headers=self._headers()).raise_for_status()
 
+    def module_list_issues(self, module_id):
+        mid = self._resolve_id(module_id, self.list_modules())
+        r = requests.get(f"{self._modules_url()}/{mid}/module-issues/", headers=self._headers())
+        r.raise_for_status()
+        return self._get_results(r.json())
+
 def main():
     p = argparse.ArgumentParser(prog="runway")
-    p.add_argument("--configure", action="store_true")
+    p.add_argument("--configure", action="store_true", help="Configure Plane connection")
+    p.add_argument("--local", action="store_true", help="Save config to project .runway.json (with --configure)")
     sub = p.add_subparsers(dest="cmd")
 
     ls = sub.add_parser("list", help="List issues")
     ls.add_argument("-l", "--limit", type=int, default=20, help="Number of issues (use -1 or 'all' for all)")
     ls.add_argument("-a", "--all", action="store_true", help="List all issues")
     ls.add_argument("--priority", "-p", choices=["none", "low", "medium", "high", "urgent"], help="Filter by priority")
+    ls.add_argument("-m", "--module", help="Filter by module ID (partial ID supported)")
     sub.add_parser("stats", help="Show issue statistics")
     sub.add_parser("get").add_argument("id")
     c = sub.add_parser("create")
@@ -252,6 +347,7 @@ def main():
     u = sub.add_parser("update")
     u.add_argument("id")
     u.add_argument("-t", "--title")
+    u.add_argument("-d", "--description")
     u.add_argument("-p", "--priority", choices=["none", "low", "medium", "high", "urgent"])
     u.add_argument("-s", "--state", choices=["backlog", "todo", "in-progress", "done", "cancelled"])
     u.add_argument("--parent")
@@ -282,6 +378,11 @@ def main():
     cr = sub.add_parser("cycle-remove-issue")
     cr.add_argument("cycle_id")
     cr.add_argument("issue_id")
+    cli = sub.add_parser("cycle-list-issues")
+    cli.add_argument("cycle_id")
+    cci = sub.add_parser("cycle-clear")
+    cci.add_argument("cycle_id")
+    cci.add_argument("-f", "--force", action="store_true")
 
     # Module commands
     sub.add_parser("modules")
@@ -306,10 +407,12 @@ def main():
     mr = sub.add_parser("module-remove-issue")
     mr.add_argument("module_id")
     mr.add_argument("issue_id")
+    mli = sub.add_parser("module-list-issues")
+    mli.add_argument("module_id")
 
     args = p.parse_args()
     if args.configure:
-        return configure()
+        return configure(local=args.local)
     if not args.cmd:
         return p.print_help()
 
@@ -317,11 +420,25 @@ def main():
     try:
         if args.cmd == "list":
             limit = 500 if args.all or args.limit == -1 else args.limit
-            issues = client.list_issues(limit)
+            if args.module:
+                # Fetch issues from module
+                module_issues = client.module_list_issues(args.module)
+                # module_list_issues returns issue references, need to get full issue details
+                issue_ids = {mi.get('issue') or mi.get('id') for mi in module_issues}
+                all_issues = client.list_issues(500)
+                issues = [i for i in all_issues if i['id'] in issue_ids]
+            else:
+                issues = client.list_issues(limit)
             if args.priority:
                 issues = [i for i in issues if i.get("priority") == args.priority]
+            # Get state names for display
+            states_url = f"{client._states_url()}/"
+            states_resp = requests.get(states_url, headers=client._headers())
+            state_map = {s["id"]: s["name"] for s in states_resp.json().get("results", [])} if states_resp.ok else {}
+            state_icons = {"Done": "🟢", "In Progress": "🔵", "Todo": "🟡", "Backlog": "⚪", "Cancelled": "⛔"}
             for i in issues:
-                icon = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(i.get("priority"), "⚪")
+                state_name = state_map.get(i.get("state"), "Unknown")
+                icon = state_icons.get(state_name, "⚪")
                 print(f"{icon} [{i['id'][:8]}] {i['name']}")
             if args.all:
                 print(f"\n{len(issues)} issues total")
@@ -350,6 +467,7 @@ def main():
         elif args.cmd == "update":
             updates = {}
             if args.title: updates["name"] = args.title
+            if args.description: updates["description_html"] = args.description.replace("\n", "<br>")
             if args.priority: updates["priority"] = args.priority
             if args.state:
                 state_id = client._get_state_id(args.state)
@@ -392,6 +510,17 @@ def main():
         elif args.cmd == "cycle-remove-issue":
             client.cycle_remove_issue(args.cycle_id, args.issue_id)
             print(f"✓ Removed {args.issue_id} from {args.cycle_id}")
+        elif args.cmd == "cycle-list-issues":
+            issues = client.cycle_list_issues(args.cycle_id)
+            for i in issues:
+                iid = i.get('issue') or i.get('id')
+                print(f"  📋 {iid[:8]}")
+            print(f"Total: {len(issues)} issues")
+        elif args.cmd == "cycle-clear":
+            if not args.force and input(f"Remove all issues from {args.cycle_id}? [y/N] ").lower() != "y":
+                sys.exit("Aborted")
+            count = client.cycle_clear_issues(args.cycle_id)
+            print(f"✓ Removed {count} issues from cycle")
         elif args.cmd == "modules":
             for m in client.list_modules():
                 print(f"📦 [{m['id'][:8]}] {m['name']} ({m.get('start_date', 'N/A')} → {m.get('target_date', 'N/A')})")
@@ -420,6 +549,22 @@ def main():
         elif args.cmd == "module-remove-issue":
             client.module_remove_issue(args.module_id, args.issue_id)
             print(f"✓ Removed {args.issue_id} from module {args.module_id}")
+        elif args.cmd == "module-list-issues":
+            module_issues = client.module_list_issues(args.module_id)
+            # Get full issue details for display
+            issue_ids = {mi.get('issue') or mi.get('id') for mi in module_issues}
+            all_issues = client.list_issues(500)
+            issues = [i for i in all_issues if i['id'] in issue_ids]
+            # Get state names for display
+            states_url = f"{client._states_url()}/"
+            states_resp = requests.get(states_url, headers=client._headers())
+            state_map = {s["id"]: s["name"] for s in states_resp.json().get("results", [])} if states_resp.ok else {}
+            state_icons = {"Done": "🟢", "In Progress": "🔵", "Todo": "🟡", "Backlog": "⚪", "Cancelled": "⛔"}
+            for i in issues:
+                state_name = state_map.get(i.get("state"), "Unknown")
+                icon = state_icons.get(state_name, "⚪")
+                print(f"{icon} [{i['id'][:8]}] {i['name']}")
+            print(f"\nTotal: {len(issues)} issues in module")
     except requests.HTTPError as e:
         sys.exit(f"API Error: {e.response.status_code} - {e.response.text}")
 
